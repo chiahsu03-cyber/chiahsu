@@ -13,6 +13,7 @@ import requests
 import streamlit as st
 import xgboost as xgb
 from PIL import Image
+from bs4 import BeautifulSoup
 from textblob import TextBlob
 
 # ───────────────────────── 基礎設定 ─────────────────────────
@@ -68,27 +69,39 @@ def img_to_b64(file) -> str:
     return base64.b64encode(buf.getvalue()).decode()
 
 
-def gemini(parts: list, model: str = GEMINI_MODEL) -> str:
+def gemini(parts: list, model: str = GEMINI_MODEL, tools=None) -> str:
     if not API_KEY:
         return "⚠️ 尚未設定 GEMINI_API_KEY"
     url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    body = {"contents": [{"parts": parts}]}
+    if tools:
+        body["tools"] = tools
     try:
         r = requests.post(
             url,
             headers={"Content-Type": "application/json", "x-goog-api-key": API_KEY},
-            json={"contents": [{"parts": parts}]},
+            json=body,
             timeout=120,
         )
         data = r.json()
         if r.status_code != 200:
             return f"API 錯誤：{data.get('error', {}).get('message', '未知錯誤')}"
-        return data["candidates"][0]["content"]["parts"][0]["text"]
+        ps = data["candidates"][0]["content"]["parts"]
+        return "".join(p.get("text", "") for p in ps)
     except Exception as e:
         return f"連線異常：{e}"
 
 
 # ───────────────────────── 蝦皮爬蟲 ─────────────────────────
-class ShopeeError(Exception):
+class FetchError(Exception):
+    pass
+
+
+class ShopeeError(FetchError):
+    pass
+
+
+class PageError(FetchError):
     pass
 
 
@@ -159,6 +172,92 @@ def fetch_shopee_reviews(shopid: int, itemid: int, max_reviews: int = 200):
     return out[:max_reviews]
 
 
+# ───────────────────────── 通用網頁（非蝦皮）─────────────────────────
+def _walk_jsonld(node, found):
+    if isinstance(node, dict):
+        if node.get("reviewBody"):
+            rating = node.get("reviewRating")
+            star = rating.get("ratingValue") if isinstance(rating, dict) else None
+            found.append({"star": star, "comment": str(node["reviewBody"]).strip(),
+                          "variant": "", "time": node.get("datePublished")})
+        for v in node.values():
+            _walk_jsonld(v, found)
+    elif isinstance(node, list):
+        for v in node:
+            _walk_jsonld(v, found)
+
+
+def extract_jsonld_reviews(soup):
+    found = []
+    for tag in soup.find_all("script", type="application/ld+json"):
+        try:
+            _walk_jsonld(json.loads(tag.string or ""), found)
+        except Exception:
+            continue
+    return found
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_generic_page(url: str):
+    try:
+        r = requests.get(url, headers={"User-Agent": UA, "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8"},
+                         timeout=15)
+    except Exception as e:
+        raise PageError(f"無法連線到該網站：{e}")
+    if r.status_code != 200:
+        raise PageError(f"網站拒絕請求（HTTP {r.status_code}）")
+    if not r.encoding or r.encoding.lower() == "iso-8859-1":
+        r.encoding = r.apparent_encoding
+    soup = BeautifulSoup(r.text, "html.parser")
+    title = soup.title.get_text(strip=True) if soup.title else ""
+    reviews = extract_jsonld_reviews(soup)  # 要在移除 script 之前
+    for t in soup(["script", "style", "noscript", "header", "footer", "nav", "svg"]):
+        t.decompose()
+    text = re.sub(r"\s+", " ", soup.get_text(" ", strip=True))
+    return {"title": title, "reviews": reviews, "text": text}
+
+
+def fetch_via_gemini(url: str) -> str:
+    """頁面內容靠 JS 動態載入時，改請 Gemini 的 URL 讀取功能代抓。"""
+    out = gemini([{"text": (
+        f"請讀取這個商品頁：{url}\n"
+        "列出頁面上所有買家評論原文（特別是身高體重、尺寸、品質相關的描述），每則一行並編號；"
+        "另外列出頁面上的尺寸表與材質說明。不要編造內容；"
+        "若無法讀取頁面或找不到評論，只回覆「無法讀取」。")}],
+        tools=[{"url_context": {}}])
+    if out.startswith(("API", "⚠️", "連線")) or "無法讀取" in out[:20] or len(out) < 50:
+        raise PageError("此網站的評論無法自動讀取（可能需登入或由 JS 動態載入）")
+    return out
+
+
+def load_reviews_from_url(url: str):
+    """依網址類型取得評論，回傳 (給 AI 的文字, 顯示給使用者的說明)。"""
+    url = url.strip()
+    if re.search(r"shopee\.|shp\.ee", url):
+        sid, iid = parse_shopee_url(url)
+        allr = fetch_shopee_reviews(sid, iid)
+        picked = select_relevant(allr)
+        return reviews_to_text(picked), f"蝦皮：共抓到 {len(allr)} 則文字評論，挑選 {len(picked)} 則送交 AI"
+
+    if not url.startswith("http"):
+        raise PageError("網址需以 http:// 或 https:// 開頭")
+    page = fetch_generic_page(url)
+    chunks, info = [], []
+    if page["reviews"]:
+        picked = select_relevant(page["reviews"]) or page["reviews"][:60]
+        chunks.append("【結構化評論】\n" + reviews_to_text(picked))
+        info.append(f"找到 {len(page['reviews'])} 則內建評論")
+    if len(page["text"]) >= 800:
+        chunks.append("【商品頁文字（可能含尺寸表、說明、評論）】\n" + page["text"][:12000])
+        info.append("已讀取頁面文字")
+    if not page["reviews"] and len(page["text"]) < 800:
+        chunks.append("【Gemini 讀取結果】\n" + fetch_via_gemini(url))
+        info.append("頁面為動態載入，改由 Gemini 讀取")
+    if not chunks:
+        raise PageError("沒有讀到任何可用內容")
+    return "\n\n".join(chunks), f"{page['title'][:40]}：" + "、".join(info)
+
+
 FIT_KEYWORDS = ["身高", "體重", "公斤", "kg", "cm", "公分", "偏小", "偏大", "好穿", "合身",
                 "寬鬆", "緊", "鬆", "短", "長", "尺寸", "size", "S號", "M號", "L號", "XL",
                 "縮水", "毛球", "起毛", "色差", "線頭", "薄", "透", "硬", "扎", "悶", "味"]
@@ -190,7 +289,7 @@ def build_prompt(stats, habit, review_text):
     u = (f"身高{stats['h']}cm、體重{stats['weight']}kg、"
          f"三圍{stats['chest']}/{stats['waist']}/{stats['hip']}cm"
          + ("（部分數值為預設平均值，僅供參考）" if stats["is_uncertain"] else ""))
-    return f"""你是嚴謹的服飾品管與版型顧問。以下是某商品的買家評論，請根據評論（以及附圖的尺寸表，若有）判斷是否適合該使用者。
+    return f"""你是嚴謹的服飾品管與版型顧問。以下是某商品的買家評論或商品頁內容，請根據評論（以及附圖的尺寸表，若有）判斷是否適合該使用者。
 
 【使用者】{u}
 【使用者過往偏好】{habit}
@@ -292,12 +391,12 @@ st.title("👗 EcoFit AI 雙引擎管家")
 tab1, tab2 = st.tabs(["🚀 深度分析", "🗄️ 智慧衣櫃"])
 
 with tab1:
-    mode = st.radio("評論來源", ["🔗 蝦皮商品連結（自動抓評論）", "📋 貼上評論文字", "🖼️ 上傳截圖"],
+    mode = st.radio("評論來源", ["🔗 商品連結（蝦皮／其他網站）", "📋 貼上評論文字", "🖼️ 上傳截圖"],
                     horizontal=True)
     shop_url, pasted, shots = "", "", None
     if mode.startswith("🔗"):
-        shop_url = st.text_input("貼上蝦皮商品網址",
-                                 placeholder="https://shopee.tw/商品名-i.123456.7890123")
+        shop_url = st.text_input("貼上商品網址",
+                                 placeholder="https://shopee.tw/… 或任何購物網站的商品頁")
     elif mode.startswith("📋"):
         pasted = st.text_area("每則評論一行", height=200)
     else:
@@ -308,20 +407,17 @@ with tab1:
         review_text, n_total = "", 0
         try:
             if shop_url:
-                with st.spinner("正在抓取蝦皮評論…"):
-                    sid, iid = parse_shopee_url(shop_url)
-                    allr = fetch_shopee_reviews(sid, iid)
-                    picked = select_relevant(allr)
-                    review_text, n_total = reviews_to_text(picked), len(allr)
-                st.caption(f"共抓到 {n_total} 則文字評論，挑選 {len(picked)} 則最相關的送交 AI")
+                with st.spinner("正在抓取評論…"):
+                    review_text, info = load_reviews_from_url(shop_url)
+                st.caption(f"📥 {info}")
             elif pasted.strip():
                 review_text = "\n".join(f"[{i}] {l}" for i, l in
                                         enumerate([x for x in pasted.splitlines() if x.strip()], 1))
             elif not shots:
                 st.error("請提供商品連結、評論文字或截圖")
                 st.stop()
-        except ShopeeError as e:
-            st.error(f"❌ {e}\n\n蝦皮會封鎖雲端主機的爬蟲請求。請改用「貼上評論文字」或「上傳截圖」模式。")
+        except FetchError as e:
+            st.error(f"❌ {e}\n\n部分網站會封鎖雲端主機的爬蟲請求。請改用「貼上評論文字」或「上傳截圖」模式。")
             st.stop()
         except Exception as e:
             st.error(f"抓取失敗：{e}")
