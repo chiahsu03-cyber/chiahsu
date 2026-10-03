@@ -25,7 +25,6 @@ BASE = Path(__file__).parent
 DB_PATH = BASE / "wardrobe.db"
 CHART_DIR = BASE / "saved_charts"
 CHART_DIR.mkdir(exist_ok=True)
-GEMINI_MODEL = "gemini-2.5-flash"
 
 
 def get_api_key() -> str:
@@ -38,6 +37,19 @@ def get_api_key() -> str:
 
 
 API_KEY = get_api_key()
+
+
+def get_model_name() -> str:
+    """模型名稱可在 Secrets 設定 GEMINI_MODEL 覆蓋，方便日後換模型。"""
+    try:
+        if "GEMINI_MODEL" in st.secrets:
+            return st.secrets["GEMINI_MODEL"]
+    except Exception:
+        pass
+    return os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
+
+
+GEMINI_MODEL = get_model_name()
 
 
 # ───────────────────────── 資料庫 ─────────────────────────
