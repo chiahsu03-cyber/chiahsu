@@ -3,6 +3,8 @@ import re
 import json
 import time
 import base64
+import zipfile
+import tempfile
 import sqlite3
 from io import BytesIO
 from pathlib import Path
@@ -338,14 +340,33 @@ def summarize_habits(_marker: float):
 
 
 # ───────────────────────── XGBoost ─────────────────────────
-def predict_size_xgb(stats, text=""):
-    mp, ep = BASE / "size_model_2.json", BASE / "label_encoder.pkl"
+@st.cache_resource(show_spinner=False)
+def load_xgb_model():
+    """載入模型；若只有 zip 壓縮檔，會自動解壓縮到暫存資料夾。"""
+    ep = BASE / "label_encoder.pkl"
+    mp = BASE / "size_model_2.json"
+    zp = BASE / "size_model_2.json.zip"
+    if not mp.exists() and zp.exists():
+        with zipfile.ZipFile(zp) as z:
+            names = [n for n in z.namelist()
+                     if n.endswith(".json") and "__MACOSX" not in n and not Path(n).name.startswith("._")]
+            if not names:
+                return None
+            mp = Path(tempfile.gettempdir()) / "size_model_2.json"
+            mp.write_bytes(z.read(names[0]))
     if not mp.exists() or not ep.exists():
-        return "⚙️ 找不到模型檔（size_model_2.json / label_encoder.pkl）"
+        return None
+    bst = xgb.XGBClassifier()
+    bst.load_model(str(mp))
+    return bst, joblib.load(ep)
+
+
+def predict_size_xgb(stats, text=""):
     try:
-        bst = xgb.XGBClassifier()
-        bst.load_model(str(mp))
-        le = joblib.load(ep)
+        loaded = load_xgb_model()
+        if loaded is None:
+            return "⚙️ 找不到模型檔（size_model_2.json(.zip) / label_encoder.pkl）"
+        bst, le = loaded
         h, b, w, hip = stats["h"], stats["chest"], stats["waist"], stats["hip"]
         sent = TextBlob(text).sentiment.polarity if text else 0
         best = None
